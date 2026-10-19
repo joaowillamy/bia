@@ -7,17 +7,13 @@
     ],
     "mcpServers": {
       "postgres": {
-      "command": "uvx",
-      "args": [
-        "--with",
-        "mcp<2",
-        "postgres-mcp",
-        "--access-mode=unrestricted"
-      ],
-      "env": {
-        "DATABASE_URI": "postgresql://postgres:postgres@localhost:5433/bia"
-      }
-    },
+        "command": "npx",
+        "args": [
+          "-y",
+          "@modelcontextprotocol/server-postgres",
+          "postgresql://postgres:postgres@localhost:5433/bia"
+        ]
+      },
       "aws-mcp": {
       "command": "uvx",
       "args": [
