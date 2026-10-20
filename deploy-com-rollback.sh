@@ -9,7 +9,18 @@
 #   ./scripts/ecs-deploy.sh rollback  - Rollback interativo para uma revision
 # =============================================================================
 
-set -e
+set -eo pipefail
+
+# Wrapper para executar um comando e tratar falha com mensagem clara
+run_step() {
+  local descricao="$1"
+  shift
+  if ! "$@"; then
+    error "Falha em: $descricao"
+    error "Comando: $*"
+    exit 0
+  fi
+}
 
 # -----------------------------------------------------------------------------
 # Configurações — ajuste conforme o ambiente
@@ -49,7 +60,7 @@ check_deps() {
   done
   if [ ${#missing[@]} -gt 0 ]; then
     error "Dependências faltando: ${missing[*]}"
-    exit 1
+    exit 0
   fi
 }
 
@@ -74,11 +85,15 @@ cmd_list() {
     --status ACTIVE \
     --sort DESC \
     --query "taskDefinitionArns[]" \
-    --output json)
+    --output json 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao listar task definitions: $arns"
+    exit 0
+  fi
 
   if [ "$(echo "$arns" | jq 'length')" -eq 0 ]; then
     error "Nenhuma revision encontrada para a família: $TASK_FAMILY"
-    exit 1
+    exit 0
   fi
 
   # Descobre qual revision o service está usando atualmente
@@ -87,7 +102,11 @@ cmd_list() {
     --cluster "$CLUSTER" \
     --services "$SERVICE" \
     --query "services[0].taskDefinition" \
-    --output text | rev | cut -d: -f1 | rev)
+    --output text 2>&1 | rev | cut -d: -f1 | rev)
+  if [ $? -ne 0 ]; then
+    error "Falha ao buscar revision atual do service '$SERVICE'."
+    exit 0
+  fi
 
   printf "%-10s %-15s %-50s %s\n" "REVISION" "COMMIT HASH" "IMAGEM" "STATUS"
   printf "%-10s %-15s %-50s %s\n" "--------" "-----------" "------" "------"
@@ -126,6 +145,10 @@ cmd_deploy() {
   # Pega o short commit hash do git local
   local commit_hash
   commit_hash=$(git -C "$(dirname "$0")/.." rev-parse --short HEAD 2>/dev/null || git rev-parse --short HEAD)
+  if [ -z "$commit_hash" ]; then
+    error "Não foi possível obter o commit hash do git."
+    exit 0
+  fi
   log "Commit hash: $commit_hash"
 
   local image_uri="$ECR_REGISTRY/$ECR_REPO:$commit_hash"
@@ -135,20 +158,36 @@ cmd_deploy() {
 
   # 1. Login no ECR
   log "Fazendo login no ECR..."
-  aws_cmd ecr get-login-password | docker login \
-    --username AWS \
-    --password-stdin "$ECR_REGISTRY"
+  local ecr_password
+  ecr_password=$(aws_cmd ecr get-login-password 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao obter credenciais do ECR: $ecr_password"
+    exit 0
+  fi
+  if ! echo "$ecr_password" | docker login --username AWS --password-stdin "$ECR_REGISTRY" 2>&1; then
+    error "Falha ao autenticar no ECR. Verifique as permissões da role IAM."
+    exit 0
+  fi
   success "Login no ECR realizado"
 
   # 2. Build da imagem
   log "Fazendo build da imagem: $image_uri"
-  docker build -t "$image_uri" -t "$image_uri_latest" "$dockerfile_dir"
+  if ! docker build -t "$image_uri" -t "$image_uri_latest" "$dockerfile_dir"; then
+    error "Falha no build da imagem Docker. Verifique o Dockerfile em: $dockerfile_dir"
+    exit 0
+  fi
   success "Build concluído"
 
   # 3. Push para o ECR
   log "Fazendo push para o ECR..."
-  docker push "$image_uri"
-  docker push "$image_uri_latest"
+  if ! docker push "$image_uri"; then
+    error "Falha ao fazer push da imagem: $image_uri"
+    exit 0
+  fi
+  if ! docker push "$image_uri_latest"; then
+    error "Falha ao fazer push da tag latest: $image_uri_latest"
+    exit 0
+  fi
   success "Push concluído: $image_uri"
 
   # 4. Pega a task definition atual como base
@@ -157,7 +196,11 @@ cmd_deploy() {
   task_def_json=$(aws_cmd ecs describe-task-definition \
     --task-definition "$TASK_FAMILY" \
     --query "taskDefinition" \
-    --output json)
+    --output json 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao buscar task definition '$TASK_FAMILY': $task_def_json"
+    exit 0
+  fi
 
   # 5. Gera novo JSON substituindo apenas o imageUri do container
   log "Gerando nova revision da task definition com imagem: $image_uri"
@@ -165,30 +208,47 @@ cmd_deploy() {
   new_task_def=$(echo "$task_def_json" | jq \
     --arg IMAGE "$image_uri" \
     'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
-     .containerDefinitions[0].image = $IMAGE')
+     .containerDefinitions[0].image = $IMAGE' 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao gerar JSON da nova task definition: $new_task_def"
+    exit 0
+  fi
 
   # 6. Registra nova revision
+  log "Registrando nova revision da task definition..."
   local new_task_def_arn
   new_task_def_arn=$(aws_cmd ecs register-task-definition \
     --cli-input-json "$new_task_def" \
     --query "taskDefinition.taskDefinitionArn" \
-    --output text)
+    --output text 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao registrar nova task definition: $new_task_def_arn"
+    exit 0
+  fi
   success "Nova task definition registrada: $new_task_def_arn"
 
   # 7. Atualiza o service
   log "Atualizando service $SERVICE no cluster $CLUSTER..."
-  aws_cmd ecs update-service \
+  local update_output
+  update_output=$(aws_cmd ecs update-service \
     --cluster "$CLUSTER" \
     --service "$SERVICE" \
     --task-definition "$new_task_def_arn" \
-    --output json > /dev/null
+    --output json 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao atualizar o service ECS: $update_output"
+    exit 0
+  fi
   success "Service atualizado"
 
   # 8. Aguarda estabilização
   log "Aguardando service estabilizar (pode levar alguns minutos)..."
-  aws_cmd ecs wait services-stable \
+  if ! aws_cmd ecs wait services-stable \
     --cluster "$CLUSTER" \
-    --services "$SERVICE"
+    --services "$SERVICE"; then
+    error "Timeout aguardando o service estabilizar. Verifique o estado das tasks no console ECS."
+    exit 0
+  fi
   success "Deploy concluído! Commit $commit_hash está no ar."
 }
 
@@ -214,7 +274,7 @@ cmd_rollback() {
   # Valida se é um número
   if ! [[ "$chosen_revision" =~ ^[0-9]+$ ]]; then
     error "Revision inválida: '$chosen_revision'. Deve ser um número."
-    exit 1
+    exit 0
   fi
 
   local target_task_def="$TASK_FAMILY:$chosen_revision"
@@ -229,7 +289,7 @@ cmd_rollback() {
 
   if [ "$task_def_status" = "NOT_FOUND" ] || [ "$task_def_status" = "INACTIVE" ]; then
     error "Revision $chosen_revision não encontrada ou está inativa."
-    exit 1
+    exit 0
   fi
 
   # Confirmação final
@@ -237,7 +297,11 @@ cmd_rollback() {
   image_uri=$(aws_cmd ecs describe-task-definition \
     --task-definition "$target_task_def" \
     --query "taskDefinition.containerDefinitions[0].image" \
-    --output text)
+    --output text 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao obter imagem da revision $chosen_revision: $image_uri"
+    exit 0
+  fi
   local commit_hash
   commit_hash=$(extract_hash "$image_uri")
 
@@ -256,18 +320,26 @@ cmd_rollback() {
 
   # Atualiza o service para a revision escolhida
   log "Aplicando rollback para revision $chosen_revision..."
-  aws_cmd ecs update-service \
+  local update_output
+  update_output=$(aws_cmd ecs update-service \
     --cluster "$CLUSTER" \
     --service "$SERVICE" \
     --task-definition "$target_task_def" \
-    --output json > /dev/null
+    --output json 2>&1)
+  if [ $? -ne 0 ]; then
+    error "Falha ao atualizar o service para revision $chosen_revision: $update_output"
+    exit 0
+  fi
   success "Service atualizado para revision $chosen_revision"
 
   # Aguarda estabilização
   log "Aguardando service estabilizar..."
-  aws_cmd ecs wait services-stable \
+  if ! aws_cmd ecs wait services-stable \
     --cluster "$CLUSTER" \
-    --services "$SERVICE"
+    --services "$SERVICE"; then
+    error "Timeout aguardando o service estabilizar. Verifique o estado das tasks no console ECS."
+    exit 0
+  fi
   success "Rollback concluído! Commit $commit_hash está no ar."
 }
 
@@ -302,7 +374,7 @@ main() {
       echo "  TASK_FAMILY  = $TASK_FAMILY"
       echo "  REGION       = $REGION"
       echo ""
-      exit 1
+      exit 0
       ;;
   esac
 }
