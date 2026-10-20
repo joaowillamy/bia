@@ -14,8 +14,8 @@ set -e
 # -----------------------------------------------------------------------------
 # Configurações — ajuste conforme o ambiente
 # -----------------------------------------------------------------------------
-CLUSTER="bia-cluster"
-SERVICE="service-bia"           # Trocar para "service-bia-alb" quando necessário
+CLUSTER="cluster-bia-alb"
+SERVICE="service-bia-alb"           # Trocar para "service-bia-alb" quando necessário
 TASK_FAMILY="task-def-bia-alb"      # Trocar para "task-def-bia-alb" quando necessário
 ECR_REGISTRY="503528589359.dkr.ecr.us-east-2.amazonaws.com"
 ECR_REPO="bia"
