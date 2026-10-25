@@ -38,3 +38,4 @@ yarn-error.log*
 
 # n8n credentials
 n8n/.env
+
