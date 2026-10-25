@@ -35,3 +35,6 @@ yarn-error.log*
 
 #mcp local
 .mcp.json
+
+# n8n credentials
+n8n/.env
