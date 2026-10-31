@@ -147,25 +147,44 @@ Todos com Outbound: `All traffic → 0.0.0.0/0`
 
 ---
 
-### Atividade 7 — EC2 — ECS Host
+### Atividade 7 — Launch Template + Auto Scaling Group
+
+> Boa prática AWS: instâncias ECS devem ser gerenciadas por ASG + Launch Template para permitir substituição automática, rolling update de AMI e integração com ECS Capacity Provider.
+
+#### Launch Template — `lt-n8n-ec2`
 
 | Campo                | Valor                                                                            |
 |----------------------|----------------------------------------------------------------------------------|
-| Nome (tag)           | `n8n-ec2`                                                                        |
-| Tipo                 | `t3.micro`                                                                       |
+| Nome                 | `lt-n8n-ec2`                                                                     |
 | AMI                  | `ami-02c06286e4c4b347e` — `al2023-ami-ecs-hvm-2023.0.20261019-kernel-6.1-x86_64` |
+| Instance type        | `t3.micro`                                                                       |
 | Key pair             | nenhum (acesso via SSM)                                                          |
 | IAM Instance Profile | `role-ecs-ec2-n8n`                                                               |
-| Security Group       | `n8n-ec2`                                                                        |
-| Subnet               | `subnet-03f065b9968750155` (us-east-2a)                                          |
-| IP público           | habilitado                                                                       |
-| User data            | registrar no cluster `cluster-n8n` via `/etc/ecs/ecs.config`                    |
+| Security Group       | `n8n-ec2` (`sg-04308cfdc4da96c35`)                                               |
+| User data (base64)   | registrar no cluster `cluster-n8n` via `/etc/ecs/ecs.config`                    |
+| Tag instance         | `Name=n8n-ec2`                                                                   |
 
 **User data:**
 ```bash
 #!/bin/bash
 echo ECS_CLUSTER=cluster-n8n >> /etc/ecs/ecs.config
 ```
+
+#### Auto Scaling Group — `asg-n8n-ec2`
+
+| Campo                     | Valor                                                             |
+|---------------------------|-------------------------------------------------------------------|
+| Nome                      | `asg-n8n-ec2`                                                     |
+| Launch Template           | `lt-n8n-ec2` (versão `$Latest`)                                   |
+| Min size                  | 1                                                                 |
+| Max size                  | 1                                                                 |
+| Desired capacity          | 1                                                                 |
+| Subnet                    | `subnet-03f065b9968750155` (us-east-2a)                           |
+| Health check type         | EC2                                                               |
+| Health check grace period | 300s                                                              |
+| Tag                       | `Name=n8n-ec2`                                                    |
+
+> O ASG garante que se a instância falhar, uma nova será provisionada automaticamente e se registrará no cluster ECS via user data.
 
 ---
 
@@ -203,6 +222,8 @@ echo ECS_CLUSTER=cluster-n8n >> /etc/ecs/ecs.config
 | `DB_POSTGRESDB_DATABASE` | `n8n`                               |
 | `DB_POSTGRESDB_USER`     | `n8n`                               |
 | `DB_POSTGRESDB_PASSWORD` | do `n8n/.env`                       |
+| `DB_POSTGRESDB_SSL_ENABLED` | `true`                           |
+| `DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED` | `false`             |
 | `N8N_HOST`               | `n8n.joaowillamy.com.br`            |
 | `N8N_PORT`               | `5678`                              |
 | `N8N_PROTOCOL`           | `https`                             |
@@ -225,13 +246,15 @@ echo ECS_CLUSTER=cluster-n8n >> /etc/ecs/ecs.config
 | Launch type               | EC2            |
 | Desired count             | 1              |
 | Deployment type           | Rolling Update |
-| Minimum healthy percent   | 50%            |
+| Minimum healthy percent   | 0%             |
 | Maximum percent           | 100%           |
 | AZ Rebalancing            | desativado     |
 | Load balancer             | `n8n-alb`      |
 | Container → porta         | `n8n:5678`     |
 | Target Group              | `tg-n8n`       |
 | Health check grace period | 60s            |
+
+> **0% / 100%:** em single mode com apenas 1 instância t3.micro, o mínimo de 50% forçaria o ECS a manter a task antiga enquanto sobe a nova — impossível com apenas 1 host. Com 0/100 o ECS derruba a task antiga antes de subir a nova, liberando recursos.
 
 ---
 
@@ -255,9 +278,9 @@ Atividade 3 → Criar Target Group (tg-n8n) — tipo instance, HTTP:5678, deregi
 Atividade 4 → Criar ALB (n8n-alb) + Listener 443
 Atividade 5 → Criar IAM Role (role-ecs-ec2-n8n) + Instance Profile
 Atividade 6 → Criar ECS Cluster (cluster-n8n)
-Atividade 7 → Criar EC2 (n8n-ec2) registrada no cluster
+Atividade 7 → Criar Launch Template (lt-n8n-ec2) + ASG (asg-n8n-ec2)
 Atividade 8 → Criar Task Definition (task-def-n8n)
-Atividade 9 → Criar ECS Service (service-n8n)
+Atividade 9 → Criar ECS Service (service-n8n) — deploy 0%/100%, AZ rebalancing desativado
 Atividade 10 → Criar Record Route 53 (n8n.joaowillamy.com.br → n8n-alb)
 Atividade 11 → Validação
 ```
@@ -281,3 +304,4 @@ Atividade 11 → Validação
 - **Listener apenas 443:** quem acessar `http://n8n.joaowillamy.com.br` receberá erro de conexão (sem redirect). Adicionar listener 80 com redirect para 443 é opcional.
 - **Memory hard limit 650 MB / soft limit 400 MB:** o n8n consome em média 250–350 MB em operação normal. O hard limit de 650 MB dá margem para picos sem comprometer o host t3.micro (1 GB RAM).
 - **Port mapping dinâmico (bridge):** o ECS escolhe a porta do host automaticamente. O Target Group do tipo `instance` resolve isso corretamente via registro automático do Service.
+- **PostgreSQL SSL:** o RDS PostgreSQL 18 exige SSL por padrão. As variáveis `DB_POSTGRESDB_SSL_ENABLED=true` e `DB_POSTGRESDB_SSL_REJECT_UNAUTHORIZED=false` são obrigatórias para a conexão funcionar. Sem elas o container crasha com erro `no pg_hba.conf entry for host ... no encryption`.
